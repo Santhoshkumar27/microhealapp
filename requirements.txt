@@ -1,0 +1,5 @@
+streamlit==1.37.1
+boto3
+Pillow
+python-dotenv
+plotly
