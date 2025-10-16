@@ -42,12 +42,39 @@ import os
 import plotly.express as px
 import plotly.graph_objects as go
 
+# ---------- Defaults (no settings UI) ----------
+DEFAULT_BUCKET = "microheal"
+DEFAULT_REGION = "ap-south-1"
+DEFAULT_DEVICE_ID = "0000000092A2DD1E"
+DEFAULT_LAST_N = 7
+
 # Optional .env (local only)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
+
+# --------------------------- Cache wrappers ---------------------------
+@st.cache_data(show_spinner=False)
+def cached_recent_sessions(bucket: str, device_id: str, region: str, limit: int = 7):
+    sess, s3, _ = s3_client(region, profile=None)
+    return recent_sessions(s3, bucket, device_id, limit=limit)
+
+@st.cache_data(show_spinner=False)
+def cached_latest_session_prefix(bucket: str, device_id: str, region: str):
+    sess, s3, _ = s3_client(region, profile=None)
+    return latest_session_prefix(s3, bucket, device_id)
+
+@st.cache_data(show_spinner=False)
+def cached_list_objects(bucket: str, prefix: str, region: str):
+    sess, s3, _ = s3_client(region, profile=None)
+    return list_objects_in_prefix(s3, bucket, prefix)
+
+@st.cache_data(show_spinner=False)
+def cached_download_bytes(bucket: str, key: str, region: str) -> bytes:
+    sess, s3, _ = s3_client(region, profile=None)
+    return download_object_bytes(s3, bucket, key)
 
 # --------------------------- S3 helpers ---------------------------
 
@@ -342,39 +369,21 @@ def card_kv(items):
 st.set_page_config(page_title="Micro Science Session Viewer", layout="wide")
 mh_header()
 st.markdown('<div class="mh-section-title">Latest Analysis</div>', unsafe_allow_html=True)
-cta_btn = st.button("Know your gut — Latest analysis", use_container_width=True)
 
-with st.sidebar:
-    st.header("S3 Settings")
-    bucket = st.text_input("Bucket name", value="microheal")
-    region = st.text_input("AWS region (optional)", value="ap-south-1")
-    profile = st.text_input("AWS profile (leave blank to use env vars)", value="")
-    device_id = st.text_input("Device ID (root folder)", value="1f0298d885aa")
-    last_n = st.number_input("Show last N sessions", min_value=1, max_value=30, value=7, step=1)
-    st.caption("Use env vars or choose a named profile (e.g., s3-uploader).")
+# Fixed configuration (no settings UI)
+bucket = DEFAULT_BUCKET
+region = DEFAULT_REGION
+profile = ""
+device_id = DEFAULT_DEVICE_ID
+last_n = DEFAULT_LAST_N
 
-    fetch_btn = st.button("Fetch")
-    diag_btn = st.button("Check AWS identity")
-
-# Diagnostics button
-if 'diag_btn' in locals() and diag_btn:
-    try:
-        sess, _, auth_src = s3_client(region, profile)
-        sts = sess.client("sts")
-        ident = sts.get_caller_identity()
-        acct = ident.get("Account", "—")
-        arn = ident.get("Arn", "—")
-        user = arn.split('/')[-1] if '/' in arn else arn
-        st.success("STS get-caller-identity succeeded")
-        st.write({"Auth source": auth_src, "Account": acct, "Arn": arn, "User": user})
-    except Exception as e:
-        st.error(f"STS identity check failed: {e}")
-        st.info("If this fails, your credentials or region/profile are not being picked up.")
-
-# Main fetch flow
-
-do_fetch = bool(fetch_btn or ('cta_btn' in locals() and cta_btn))
-force_latest = bool('cta_btn' in locals() and cta_btn)
+# Auto-fetch on first load only (prevents re-trigger on tab changes)
+if "_auto_fetch_done" not in st.session_state:
+    st.session_state["_auto_fetch_done"] = True
+    do_fetch = True
+else:
+    do_fetch = True  # always render using cached data
+force_latest = True
 
 if do_fetch:
     if not bucket or not device_id:
@@ -384,9 +393,9 @@ if do_fetch:
     sess, s3, auth_src = s3_client(region, profile)
     st.info(f"Auth source: {auth_src}")
 
-    # Build recent sessions and let the user pick
+    # Build recent sessions
     try:
-        recents = recent_sessions(s3, bucket, device_id, limit=int(last_n))
+        recents = cached_recent_sessions(bucket, device_id, region, limit=int(last_n))
     except ClientError as e:
         st.error(f"S3 error while listing sessions: {e}")
         st.stop()
@@ -395,27 +404,19 @@ if do_fetch:
         st.error(f"No sessions found for device `{device_id}`.")
         st.stop()
 
-    # Build short labels
     def short_label(pref: str) -> str:
         parts = pref.strip('/').split('/')
-        # Expect: device / YYYY-MM-DD / YYYYMMDD_HHMMSS
         return f"{parts[-2]} · {parts[-1]}"
 
-    if force_latest:
-        prefix = recents[-1]
-        st.success(f"Auto-selected latest session: `{prefix}`")
-    else:
-        labels = [short_label(p) for p in recents]
-        default_idx = len(labels) - 1
-        choice = mh_session_selector("Session", labels, default_idx)
-        prefix = recents[choice]
-        st.success(f"Selected session: `{prefix}`")
+    latest_pref = cached_latest_session_prefix(bucket, device_id, region)
+    prefix = latest_pref if latest_pref else recents[-1]
+    st.success(f"Auto-selected latest session: `{prefix}`")
 
     # Tabs for a clean mobile-friendly UI
     tab_overview, tab_photos, tab_audio, tab_details = st.tabs(["Overview", "Photos", "Audio", "Details"])
 
     # List objects once
-    keys = list_objects_in_prefix(s3, bucket, prefix)
+    keys = cached_list_objects(bucket, prefix, region)
     imgs = [k for k in keys if k.lower().endswith((".jpg", ".jpeg", ".png"))]
     wavs = [k for k in keys if k.lower().endswith(".wav")]
     analytics_key = next((k for k in keys if k.lower().endswith("analytics.json")), None)
@@ -440,7 +441,7 @@ if do_fetch:
             aj = {}
             if analytics_key:
                 try:
-                    data = download_object_bytes(s3, bucket, analytics_key)
+                    data = cached_download_bytes(bucket, analytics_key, region)
                     aj = json.loads(data.decode("utf-8"))
                 except Exception as e:
                     st.warning(f"Failed to read analytics.json: {e}")
@@ -499,7 +500,7 @@ if do_fetch:
             sp = {}
             if sess_presence_key:
                 try:
-                    data = download_object_bytes(s3, bucket, sess_presence_key)
+                    data = cached_download_bytes(bucket, sess_presence_key, region)
                     sp = json.loads(data.decode("utf-8"))
                 except Exception as e:
                     st.warning(f"Failed to read session_presence.json: {e}")
@@ -507,7 +508,7 @@ if do_fetch:
             last_line = None
             if presence_jsonl_key:
                 try:
-                    data = download_object_bytes(s3, bucket, presence_jsonl_key).decode("utf-8", "replace")
+                    data = cached_download_bytes(bucket, presence_jsonl_key, region).decode("utf-8", "replace")
                     lines = [ln.strip() for ln in data.splitlines() if ln.strip()]
                     last_line = json.loads(lines[-1]) if lines else None
                 except Exception as e:
@@ -538,11 +539,11 @@ if do_fetch:
         trend_labels, trend_bristol, trend_dur = [], [], []
         for p in recents:
             try:
-                keys_r = list_objects_in_prefix(s3, bucket, p)
+                keys_r = cached_list_objects(bucket, p, region)
                 ak = next((k for k in keys_r if k.lower().endswith("analytics.json")), None)
                 if not ak:
                     continue
-                data = download_object_bytes(s3, bucket, ak)
+                data = cached_download_bytes(bucket, ak, region)
                 ajr = json.loads(data.decode("utf-8"))
                 avg_b, _ = parse_bristol_info(ajr)
                 dur = ajr.get("sessionDurationSeconds") or ajr.get("durationSeconds") or 0
@@ -597,7 +598,7 @@ if do_fetch:
             html_imgs = []
             for k in imgs_sorted:
                 try:
-                    jb = download_object_bytes(s3, bucket, k)
+                    jb = cached_download_bytes(bucket, k, region)
                     img = Image.open(io.BytesIO(jb)).convert("RGB")
                     # Write to in-memory PNG for <img> src as bytes
                     buf = io.BytesIO(); img.save(buf, format="PNG"); b64 = buf.getvalue()
@@ -618,7 +619,7 @@ if do_fetch:
             wavs_sorted = sorted(wavs)
             first = wavs_sorted[0]
             try:
-                wb = download_object_bytes(s3, bucket, first)
+                wb = cached_download_bytes(bucket, first, region)
                 st.caption(Path(first).name)
                 st.audio(wb, format="audio/wav")
             except Exception as e:
@@ -633,21 +634,21 @@ if do_fetch:
 
         if analytics_key:
             try:
-                data = download_object_bytes(s3, bucket, analytics_key)
+                data = cached_download_bytes(bucket, analytics_key, region)
                 st.markdown('<div class="mh-section-title">analytics.json</div>', unsafe_allow_html=True)
                 st.json(json.loads(data.decode("utf-8")), expanded=False)
             except Exception:
                 pass
         if sess_presence_key:
             try:
-                data = download_object_bytes(s3, bucket, sess_presence_key)
+                data = cached_download_bytes(bucket, sess_presence_key, region)
                 st.markdown('<div class="mh-section-title">session_presence.json</div>', unsafe_allow_html=True)
                 st.json(json.loads(data.decode("utf-8")), expanded=False)
             except Exception:
                 pass
         if presence_jsonl_key:
             try:
-                data = download_object_bytes(s3, bucket, presence_jsonl_key).decode("utf-8", "replace")
+                data = cached_download_bytes(bucket, presence_jsonl_key, region).decode("utf-8", "replace")
                 st.markdown('<div class="mh-section-title">presence.jsonl (tail)</div>', unsafe_allow_html=True)
                 lines = [ln for ln in data.splitlines() if ln.strip()]
                 st.code("\n".join(lines[-20:]))
@@ -664,7 +665,7 @@ if do_fetch:
       ''',
       unsafe_allow_html=True
     )
-    st.button("Click here for latest analysis", use_container_width=True, key="footer_cta")
+    # (Footer CTA removed)
 
     # Bottom nav (cosmetic)
     st.markdown(
