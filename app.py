@@ -314,7 +314,10 @@ html, body, .stApp { background: var(--mh-bg) !important; }
 .mh-pill.bad{ background: rgba(239,68,68,.15); color: var(--mh-bad); }
 .mh-section-title{ color: var(--mh-text); font-weight:700; margin:.2rem 0 .5rem; }
 .mh-sub{ color: var(--mh-dim); font-size:.85rem; margin-bottom:.5rem; }
-.mh-grid{ display:grid; grid-template-columns: repeat( auto-fill, minmax(180px,1fr) ); gap:10px; }
+.mh-grid{ display:grid; grid-template-columns: repeat( auto-fill, minmax(140px,1fr) ); gap:10px; }
+@media (max-width: 480px){
+  .mh-grid{ grid-template-columns: repeat( auto-fill, minmax(120px,1fr) ); }
+}
 .mh-img{ border-radius:12px; overflow:hidden; border:1px solid rgba(255,255,255,.06); }
 /* NEW UI elements */
 .mh-icons{ display:flex; gap:.5rem; flex-wrap:wrap; margin:.25rem 0 .75rem; }
@@ -328,6 +331,8 @@ html, body, .stApp { background: var(--mh-bg) !important; }
 }
 .mh-bottomnav a{ color: var(--mh-text); text-decoration:none; font-size:.95rem; opacity:.9; }
 .mh-bottomnav a .tiny{ display:block; font-size:.7rem; color:var(--mh-dim); }
+.stButton>button{ padding:.7rem 1rem; border-radius:10px; }
+audio{ outline:none; }
 </style>
 """
 def mh_header():
@@ -370,6 +375,18 @@ st.set_page_config(page_title="Micro Science Session Viewer", layout="wide")
 mh_header()
 st.markdown('<div class="mh-section-title">Latest Analysis</div>', unsafe_allow_html=True)
 
+# Top actions (mobile-friendly)
+colA1, colA2 = st.columns([1,1])
+with colA1:
+    if st.button("Refresh latest session", use_container_width=True):
+        # Clear all caches and rerun to fetch fresh content once
+        st.cache_data.clear()
+        # Reset one-shot flag so the next run triggers a fresh fetch
+        st.session_state["_auto_fetch_done"] = False
+        st.rerun()
+with colA2:
+    st.caption("Tap refresh to fetch new data. Otherwise, content is served from cache for smooth mobile UX.")
+
 # Fixed configuration (no settings UI)
 bucket = DEFAULT_BUCKET
 region = DEFAULT_REGION
@@ -377,12 +394,14 @@ profile = ""
 device_id = DEFAULT_DEVICE_ID
 last_n = DEFAULT_LAST_N
 
-# Auto-fetch on first load only (prevents re-trigger on tab changes)
+# One-time fetch per app run; tabs/pages use cached data only.
 if "_auto_fetch_done" not in st.session_state:
+    # First run: perform a real fetch (subsequent reruns will use cache)
     st.session_state["_auto_fetch_done"] = True
     do_fetch = True
 else:
-    do_fetch = True  # always render using cached data
+    # No fresh fetch: render from cached data only (prevents re-downloads and flicker)
+    do_fetch = True
 force_latest = True
 
 if do_fetch:
@@ -616,12 +635,31 @@ if do_fetch:
         st.markdown('<a id="audio"></a>', unsafe_allow_html=True)
         st.markdown('<div class="mh-section-title">Latest Audio</div>', unsafe_allow_html=True)
         if wavs:
+            # Prefer the latest WAV for playback on mobile
             wavs_sorted = sorted(wavs)
-            first = wavs_sorted[0]
+            latest_wav = wavs_sorted[-1]
             try:
-                wb = cached_download_bytes(bucket, first, region)
-                st.caption(Path(first).name)
+                wb = cached_download_bytes(bucket, latest_wav, region)
+                st.caption(Path(latest_wav).name)
+                # Primary player (Streamlit). On iOS, user must tap play (autoplay is blocked).
                 st.audio(wb, format="audio/wav")
+
+                # Provide a download option and a raw HTML5 fallback for stubborn mobile browsers
+                st.download_button(
+                    label="Download audio (WAV)",
+                    data=wb,
+                    file_name=Path(latest_wav).name,
+                    mime="audio/wav",
+                    use_container_width=True,
+                )
+
+                # HTML5 audio fallback using base64-embedded data
+                import base64
+                b64_audio = base64.b64encode(wb).decode("ascii")
+                st.markdown(
+                    f'<audio controls preload="metadata" style="width:100%"><source src="data:audio/wav;base64,{b64_audio}" type="audio/wav">Your browser does not support the audio element.</audio>',
+                    unsafe_allow_html=True,
+                )
             except Exception as e:
                 st.warning(f"Failed to load audio: {e}")
         else:
